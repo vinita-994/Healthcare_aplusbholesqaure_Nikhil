@@ -1,57 +1,101 @@
 import os
 import numpy as np
+import pandas as pd
 import pydicom
+import nibabel as nib
+import ants
 from skimage.transform import resize
 
-# 🔒 Raw DICOM folder
+# ================= PATHS =================
 DICOM_DIR = "MRI"
+CSV_LABELS = "MRI_metadata.csv"
+OUT_DIR = "dataset/processed"
+TARGET_SHAPE = (128,128,128)
 
-# ✅ Processed output
-PROCESSED_DIR = "dataset/processed"
+os.makedirs(OUT_DIR, exist_ok=True)
 
-TARGET_SHAPE = (128, 128, 128)
+# ================= LOAD CSV =================
+labels_df = pd.read_csv(CSV_LABELS)
 
-os.makedirs(PROCESSED_DIR, exist_ok=True)
+# Keep only needed columns
+labels_df = labels_df[["Subject", "Group"]]
+labels_df.columns = ["Subject", "label"]
 
-print("🔄 Reading DICOM scans without modifying originals...")
+print("🔄 Starting FULL MRI preprocessing pipeline...")
 
-def load_dicom_series(folder):
+# ================= DICOM → NIFTI =================
+def dicom_to_nifti(folder):
     slices = []
-    
     for f in os.listdir(folder):
         if f.endswith(".dcm"):
-            path = os.path.join(folder, f)
-            ds = pydicom.dcmread(path)
+            ds = pydicom.dcmread(os.path.join(folder, f))
             slices.append(ds)
 
-    # Sort by slice position
     slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
+    volume = np.stack([s.pixel_array for s in slices]).astype(np.float32)
+    return nib.Nifti1Image(volume, affine=np.eye(4))
 
-    volume = np.stack([s.pixel_array for s in slices])
-    return volume.astype(np.float32)
+# ================= SKULL STRIP =================
+def skull_strip(nifti_img):
+    ants_img = ants.from_numpy(nifti_img.get_fdata())
+    brain_mask = ants.get_mask(ants_img)
+    return ants_img * brain_mask
 
-def preprocess_volume(volume):
-    volume = resize(volume, TARGET_SHAPE, mode='constant', preserve_range=True)
-    volume = (volume - np.min(volume)) / (np.max(volume) - np.min(volume) + 1e-8)
-    return volume
+# ================= MNI REGISTRATION =================
+def register_to_mni(brain_img):
+    mni = ants.image_read(ants.get_ants_data('mni'))
+    reg = ants.registration(fixed=mni, moving=brain_img, type_of_transform='Affine')
+    return reg['warpedmovout']
 
-series_count = 0
+# ================= GM SEGMENTATION =================
+def segment_gm(img):
+    seg = ants.kmeans_segmentation(img, k=3)['segmentation']
+    gm = (seg == 2) * img
+    return gm
 
-# Find folders that contain DICOM slices
+# ================= FINAL PREPROCESS =================
+def final_preprocess(img):
+    vol = img.numpy()
+    vol = resize(vol, TARGET_SHAPE, mode='constant', preserve_range=True)
+    vol = (vol - vol.min()) / (vol.max() - vol.min() + 1e-8)
+    return vol.astype(np.float32)
+
+# ================= MAIN LOOP =================
+count = 0
+
 for root, dirs, files in os.walk(DICOM_DIR):
     if any(f.endswith(".dcm") for f in files):
         try:
-            volume = load_dicom_series(root)
-            volume = preprocess_volume(volume)
+            # Extract subject ID from folder path
+            parts = root.split(os.sep)
+            Subject = next((p for p in parts if "_S_" in p), None)
 
-            sid = os.path.basename(root)
-            np.save(os.path.join(PROCESSED_DIR, sid + ".npy"), volume)
+            if Subject is None:
+                print("⚠ Subject ID not found:", root)
+                continue
 
-            print("✅ Processed series:", sid)
-            series_count += 1
+            label_row = labels_df[labels_df["Subject"] == Subject]
+            if label_row.empty:
+                print("⚠ Label missing for", Subject)
+                continue
+
+            label = label_row["label"].values[0]
+
+            # ---- PROCESS PIPELINE ----
+            nifti = dicom_to_nifti(root)
+            brain = skull_strip(nifti)
+            registered = register_to_mni(brain)
+            gm = segment_gm(registered)
+            processed = final_preprocess(gm)
+
+            np.save(os.path.join(OUT_DIR, f"{Subject}_X.npy"), processed)
+            np.save(os.path.join(OUT_DIR, f"{Subject}_y.npy"), label)
+
+            print("✅ Finished:", Subject)
+            count += 1
 
         except Exception as e:
-            print("❌ Skipped folder:", root, "Error:", e)
+            print("❌ Error with", root, e)
 
-print(f"🎉 Done! {series_count} MRI volumes processed.")
+print(f"\n🎉 TASK-1 COMPLETE → {count} MRI volumes processed")
 print("📂 Raw DICOM data remains untouched.")
