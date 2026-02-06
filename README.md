@@ -14,5 +14,9 @@ Original raw MRI data remains untouched during all preprocessing steps.
 This stage produces a clean, structured, and model-ready neuroimaging dataset.  
 Upcoming tasks will implement advanced 3D CNN architectures for disease classification.  
 Training strategies will focus on high accuracy, robustness, and clinical reliability.  
-The goal is a medical-grade AI system achieving over 96% diagnostic accuracy.  
+The goal is a medical-grade AI system achieving over 91% diagnostic accuracy.  
 EOF
+
+## Dataset
+Due to GitHub size limits, the MRI dataset is stored here:
+[Download Dataset](https://drive.google.com/drive/folders/1lywrhH21oO8lY29gTu40B0utm2Ditigz?usp=sharing)
