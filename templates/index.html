@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MRI AI Diagnosis</title>
+    <style>
+        body {
+            background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+            color: white;
+            font-family: Arial;
+            text-align: center;
+            padding-top: 50px;
+        }
+        .box {
+            background: #111;
+            padding: 30px;
+            border-radius: 15px;
+            width: 50%;
+            margin: auto;
+            box-shadow: 0px 0px 20px cyan;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            background: cyan;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+<div class="box">
+    <h1>MRI AI Diagnosis</h1>
+    <input type="file" id="fileInput"><br><br>
+    <button onclick="uploadMRI()">Upload & Diagnose</button>
+    <div id="result" style="margin-top:20px;"></div>
+</div>
+
+<script>
+async function uploadMRI() {
+    let fileInput = document.getElementById("fileInput");
+
+    if (!fileInput.files.length) {
+        document.getElementById("result").innerHTML = "⚠ Please select a file first.";
+        return;
+    }
+
+    let formData = new FormData();
+    formData.append("file", fileInput.files[0]);
+
+    document.getElementById("result").innerHTML = "⏳ Processing MRI scan...";
+
+    let response = await fetch("/predict", {
+        method: "POST",
+        body: formData
+    });
+
+    let data = await response.json();
+
+    // 🚫 If backend sends error
+    if (data.error) {
+        document.getElementById("result").innerHTML = "❌ " + data.error;
+        return;
+    }
+
+    // ✅ Smart result display
+    let output = `<h2>🧠 Screening Result</h2>`;
+    output += `<b>Type:</b> ${data.type}<br>`;
+    output += `<b>Diagnosis:</b> ${data.diagnosis}<br>`;
+    output += `<b>Confidence:</b> ${data.confidence}<br><br>`;
+
+    // Show probabilities ONLY for AI prediction
+    if (data.probabilities) {
+        output += `<b>Prediction Probabilities:</b><br>`;
+        output += `CN: ${(data.probabilities.CN*100).toFixed(2)}%<br>`;
+        output += `MCI: ${(data.probabilities.MCI*100).toFixed(2)}%<br>`;
+        output += `AD: ${(data.probabilities.AD*100).toFixed(2)}%`;
+    }
+
+    document.getElementById("result").innerHTML = output;
+}
+</script>
+
+
+</body>
+</html>
