@@ -1,234 +1,178 @@
 # =========================================================
-# HIGH-PERFORMANCE MRI CLASSIFIER (RESNET + FOCAL LOSS)
+# HIGH-PERFORMANCE BUT GENTLE 2D MRI CLASSIFIER
+# Target Balanced Accuracy > 91%
 # =========================================================
 
 import os
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models, transforms
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import balanced_accuracy_score, roc_auc_score, confusion_matrix
 from scipy.ndimage import rotate
 
-# ================= CONFIGURATION =================
-CONFIG = {
-    "lr": 1e-4,
-    "batch_size": 2,          # Keep low for VRAM
-    "accum_steps": 16,        # Simulates batch_size = 32
-    "epochs": 50,
-    "patience": 10,
-    "path": "dataset/processed",
-    "save_path": "best_mri_model.pth"
-}
+DATA_PATH = "dataset/processed"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 6
+EPOCHS = 40
+LR = 1e-4
 
-# ================= UTILS: FOCAL LOSS =================
-# Helps model focus on "hard" examples rather than easy background
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
+# ================= SAFE DATA LOADING =================
+samples, labels = [], []
 
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
+for f in os.listdir(DATA_PATH):
+    if f.endswith("_X.npy"):
+        sid = f.replace("_X.npy","")
+        try:
+            vol = np.load(os.path.join(DATA_PATH, sid+"_X.npy"))
+            lab = str(np.load(os.path.join(DATA_PATH, sid+"_y.npy")))
+            if vol.size == 0: continue
+            samples.append(sid)
+            labels.append(0 if lab=="CN" else 1)
+        except:
+            continue
 
-# ================= ROBUST DATASET =================
-class AdvancedMRIDataset(Dataset):
-    def __init__(self, folder, train=True):
-        self.folder = folder
-        self.samples = sorted([f.replace("_X.npy","") for f in os.listdir(folder) if f.endswith("_X.npy")])
+samples = np.array(samples)
+labels = np.array(labels)
+
+# =====================================================
+class MRIDataset(Dataset):
+    def __init__(self, indices, train=True):
+        self.indices = indices
         self.train = train
 
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((224,224)),
+            transforms.Normalize([0.5],[0.5])
+        ])
+
     def __len__(self):
-        return len(self.samples)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        sid = self.samples[idx]
-        X = np.load(os.path.join(self.folder, sid+"_X.npy")).astype(np.float32)
-        y = np.load(os.path.join(self.folder, sid+"_y.npy"))
+        sid = samples[self.indices[idx]]
+        vol = np.load(os.path.join(DATA_PATH, sid+"_X.npy")).astype(np.float32)
+        label = labels[self.indices[idx]]
 
-        # --- 1. ROBUST NORMALIZATION ---
-        # Clip top/bottom 1% intensities to remove outliers (MRI artifacts)
-        p1 = np.percentile(X, 1)
-        p99 = np.percentile(X, 99)
-        X = np.clip(X, p1, p99)
-        # Min-Max scale to 0-1 range
-        X = (X - X.min()) / (X.max() - X.min() + 1e-8)
+        # Soft normalization
+        p1,p99 = np.percentile(vol,(1,99))
+        vol = np.clip(vol,p1,p99)
+        vol = (vol-vol.min())/(vol.max()-vol.min()+1e-8)
 
-        # --- 2. ADVANCED AUGMENTATION ---
-        if self.train:
-            # Random Rotation (-10 to 10 degrees)
-            if np.random.rand() > 0.5:
-                angle = np.random.uniform(-10, 10)
-                # Rotate around Z-axis (axial plane)
-                X = rotate(X, angle, axes=(1, 2), reshape=False, mode='nearest')
-            
-            # Random Intensity Shift
-            if np.random.rand() > 0.5:
-                X = X * np.random.uniform(0.9, 1.1)
+        # 🔹 Use 3 central slices (better signal)
+        mid = vol.shape[0]//2
+        slices = [vol[mid-2], vol[mid], vol[mid+2]]
 
-            # Elastic-like Flips
-            if np.random.rand() > 0.5: X = np.flip(X, axis=0) # Sagittal
-            if np.random.rand() > 0.5: X = np.flip(X, axis=2) # Axial
+        imgs = []
+        for s in slices:
+            if self.train and np.random.rand()>0.6:
+                s = rotate(s, np.random.uniform(-8,8), reshape=False)
 
-        X = torch.tensor(X.copy()).unsqueeze(0) # Add Channel Dim
-        y = torch.tensor(0 if y == "CN" else 1, dtype=torch.long)
-        return X, y
+            img = np.stack([s,s,s], axis=-1)
+            img = self.transform(img)
+            imgs.append(img)
 
-# ================= MODEL: RESIDUAL 3D CNN =================
-class ResidualBlock(nn.Module):
-    def __init__(self, in_c, out_c, stride=1):
-        super().__init__()
-        self.conv1 = nn.Conv3d(in_c, out_c, 3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm3d(out_c)
-        self.conv2 = nn.Conv3d(out_c, out_c, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_c)
-        
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_c != out_c:
-            self.shortcut = nn.Sequential(
-                nn.Conv3d(in_c, out_c, 1, stride=stride, bias=False),
-                nn.BatchNorm3d(out_c)
-            )
+        imgs = torch.stack(imgs)  # [3,3,224,224]
+        return imgs.float(), torch.tensor(label).long()
 
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        return F.relu(out)
-
-class ResNet3D_Light(nn.Module):
+# =====================================================
+class MRIModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.pre = nn.Sequential(
-            nn.Conv3d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm3d(32),
-            nn.ReLU()
-        )
-        
-        # Deep Residual Layers
-        self.layer1 = ResidualBlock(32, 32)
-        self.layer2 = ResidualBlock(32, 64, stride=2) # Downsample
-        self.layer3 = ResidualBlock(64, 128, stride=2) # Downsample
-        self.pool = nn.AdaptiveAvgPool3d(1)
-        
-        self.fc = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(128, 2)
+        self.backbone = models.resnet18(weights="IMAGENET1K_V1")
+        self.backbone.fc = nn.Identity()
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(512,2)
         )
 
-    def forward(self, x):
-        x = self.pre(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.pool(x)
-        x = x.flatten(1)
-        return self.fc(x)
+    def forward(self,x):  # x [B,S,3,224,224]
+        B,S,C,H,W = x.shape
+        x = x.view(B*S,C,H,W)
+        feats = self.backbone(x)
+        feats = feats.view(B,S,512).mean(dim=1)  # gentle slice fusion
+        return self.classifier(feats)
 
-# ================= SETUP =================
-full_dataset = AdvancedMRIDataset(CONFIG["path"], train=True)
+# =====================================================
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-# Stratified Split
-labels = [0 if np.load(os.path.join(CONFIG["path"], s+"_y.npy"))=="CN" else 1 for s in full_dataset.samples]
-train_idx, val_idx = train_test_split(list(range(len(full_dataset))), test_size=0.2, stratify=labels, random_state=42)
+fold_accs, fold_aucs = [], []
 
-train_loader = DataLoader(Subset(full_dataset, train_idx), batch_size=CONFIG["batch_size"], shuffle=True, num_workers=2)
-val_loader = DataLoader(Subset(AdvancedMRIDataset(CONFIG["path"], train=False), val_idx), batch_size=CONFIG["batch_size"], shuffle=False, num_workers=2)
+for fold,(train_idx,val_idx) in enumerate(skf.split(samples,labels)):
+    print(f"\n=========== FOLD {fold+1} ===========")
 
-model = ResNet3D_Light().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG["lr"], weight_decay=1e-3)
-criterion = FocalLoss(alpha=1, gamma=2)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG["epochs"])
+    train_ds = MRIDataset(train_idx,train=True)
+    val_ds   = MRIDataset(val_idx,train=False)
 
-# ================= TRAINING LOOP =================
-print("🚀 Starting High-Performance Training...")
-best_auc = 0
-trigger_times = 0
+    train_loader = DataLoader(train_ds,batch_size=BATCH_SIZE,shuffle=True)
+    val_loader   = DataLoader(val_ds,batch_size=BATCH_SIZE)
 
-for epoch in range(CONFIG["epochs"]):
-    model.train()
-    train_loss = 0
-    optimizer.zero_grad() 
+    model = MRIModel().to(DEVICE)
 
-    for i, (X, y) in enumerate(train_loader):
-        X, y = X.to(device), y.to(device)
-        
-        out = model(X)
-        loss = criterion(out, y)
-        
-        # GRADIENT ACCUMULATION (Simulates larger batch size)
-        loss = loss / CONFIG["accum_steps"]
-        loss.backward()
+    # Class weights (helps balanced accuracy)
+    class_counts = np.bincount(labels[train_idx])
+    weights = torch.tensor([1/c for c in class_counts], dtype=torch.float32).to(DEVICE)
 
-        if (i + 1) % CONFIG["accum_steps"] == 0:
-            optimizer.step()
-            optimizer.zero_grad()
-            
-        train_loss += loss.item() * CONFIG["accum_steps"]
+    criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.05)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,EPOCHS)
 
-    # ===== VALIDATION =====
+    best_auc, patience, counter = 0, 7, 0
+
+    for epoch in range(EPOCHS):
+        model.train()
+        for imgs,y in train_loader:
+            imgs,y = imgs.to(DEVICE),y.to(DEVICE)
+            loss = criterion(model(imgs),y)
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        model.eval()
+        y_true,y_scores=[],[]
+
+        with torch.no_grad():
+            for imgs,y in val_loader:
+                imgs = imgs.to(DEVICE)
+                probs = torch.softmax(model(imgs),1)[:,1].cpu().numpy()
+                y_scores.extend(probs); y_true.extend(y.numpy())
+
+        auc = roc_auc_score(y_true,y_scores)
+        scheduler.step()
+        print(f"Epoch {epoch+1} AUC: {auc:.4f}")
+
+        if auc > best_auc:
+            best_auc = auc
+            torch.save(model.state_dict(),f"best_fold_{fold}.pth")
+            counter = 0
+        else:
+            counter += 1
+            if counter>=patience:
+                print("Early stopping"); break
+
+    model.load_state_dict(torch.load(f"best_fold_{fold}.pth",weights_only=True))
     model.eval()
-    val_loss = 0
-    y_true, y_scores = [], []
-    
+
+    y_true,y_pred,y_scores=[],[],[]
     with torch.no_grad():
-        for X, y in val_loader:
-            X, y = X.to(device), y.to(device)
-            out = model(X)
-            val_loss += criterion(out, y).item()
-            
-            probs = torch.softmax(out, 1)[:, 1].cpu().numpy()
-            y_true.extend(y.cpu().numpy())
-            y_scores.extend(probs)
+        for imgs,y in val_loader:
+            imgs = imgs.to(DEVICE)
+            probs = torch.softmax(model(imgs),1)[:,1].cpu().numpy()
+            preds = (probs>0.5).astype(int)
+            y_true.extend(y.numpy()); y_pred.extend(preds); y_scores.extend(probs)
 
-    try:
-        current_auc = roc_auc_score(y_true, y_scores)
-    except:
-        current_auc = 0.5 # Handle single class edge case
+    bal_acc = balanced_accuracy_score(y_true,y_pred)
+    auc = roc_auc_score(y_true,y_scores)
 
-    scheduler.step()
-    
-    print(f"Epoch {epoch+1}/{CONFIG['epochs']} | Train Loss: {train_loss/len(train_loader):.4f} | Val Loss: {val_loss/len(val_loader):.4f} | AUC: {current_auc:.4f}")
+    print("Balanced Accuracy:",bal_acc)
+    print("AUC:",auc)
+    print(confusion_matrix(y_true,y_pred))
 
-    # ===== EARLY STOPPING & SAVING =====
-    if current_auc > best_auc:
-        best_auc = current_auc
-        torch.save(model.state_dict(), CONFIG["save_path"])
-        print(f"    >>> New Best Model Saved! (AUC: {best_auc:.4f})")
-        trigger_times = 0
-    else:
-        trigger_times += 1
-        if trigger_times >= CONFIG["patience"]:
-            print("Early stopping!")
-            break
+    fold_accs.append(bal_acc)
+    fold_aucs.append(auc)
 
-# ================= FINAL REPORT =================
-print("\n📊 FINAL EVALUATION")
-model.load_state_dict(torch.load(CONFIG["save_path"]))
-model.eval()
-y_pred = []
-y_true = []
-y_scores = []
-
-with torch.no_grad():
-    for X, y in val_loader:
-        X = X.to(device)
-        out = model(X)
-        probs = torch.softmax(out, 1)[:, 1].cpu().numpy()
-        preds = (probs > 0.4).astype(int) # Optimized threshold
-        
-        y_true.extend(y.numpy())
-        y_pred.extend(preds)
-        y_scores.extend(probs)
-
-print(classification_report(y_true, y_pred))
-print(f"Final AUC: {roc_auc_score(y_true, y_scores):.4f}")
-print("Confusion Matrix:\n", confusion_matrix(y_true, y_pred))
+print("\n===== FINAL RESULTS =====")
+print("Mean Balanced Accuracy:",np.mean(fold_accs))
+print("Mean AUC:",np.mean(fold_aucs))
